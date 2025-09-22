@@ -5,7 +5,6 @@
 #include <thread>
 #include <condition_variable>
 #include <mutex>
-#include <numeric>
 
 #include "Usings.h"
 #include "Order.h"
@@ -19,194 +18,60 @@ private:
 	struct OrderEntry // a single order entry in the orderbook
 	{
 		OrderPointer order_{nullptr}; // the order pointer
-		OrderPointers::iterator
-			location_; // the location of the order in the orderbook
+		OrderPointers::iterator location_; // the location of the order in the orderbook
 	};
-	std::map<Price, OrderPointers, std::greater<Price>>
-		bids_; // bids are sorted in descending order to get the best bid price
-	std::map<Price, OrderPointers, std::less<Price>>
-		asks_; // asks are sorted in ascending order to get the best ask price
-	std::unordered_map<OrderId, OrderEntry> orders_;
-	bool CanMatch(Side side,
-				  Price price) const // check if the order can be matched (for
-									 // FillAndKill and ImmediateOrCancel orders)
+	struct LevelData // metadata for each price level
 	{
-		if (side == Side::Buy)
-		{
-			if (asks_.empty())
-			{
-				return false;
-			}
-			const auto &[bestAsk, _] = *asks_.begin(); // get the best ask price
-			return price >= bestAsk;
-		}
-		else
-		{
-			if (bids_.empty())
-			{
-				return false;
-			}
-			const auto &[bestBid, _] = *bids_.begin(); // get the best bid price
-			return price <= bestBid;
-		}
-	}
-	Trades MatchOrders()
-	{
-		Trades trades;
-		trades.reserve(orders_.size());
-		while (true) // keep matching orders until no more orders can be matched
-		{
-			if (bids_.empty() || asks_.empty()) // no more orders to match
-			{
-				break;
-			}
-			auto &[bidPrice, bids] = *bids_.begin();
-			auto &[askPrice, asks] = *asks_.begin();
-			if (bidPrice < askPrice) // no more valid orders to match
-			{
-				break;
-			}
-			while (bids.size() && asks.size())
-			{
-				auto &bid = bids.front();
-				auto &ask = asks.front();
-				Quantity quantity = std::min(bid->GetRemainingQuantity(),
-											 ask->GetRemainingQuantity());
-				bid->Fill(quantity);
-				ask->Fill(quantity);
+		Quantity quantity_{};
+		Quantity count_{};
 
-				if (bid->IsFilled())
-				{
-					bids.pop_front();
-					orders_.erase(bid->GetOrderID());
-				}
-				if (ask->IsFilled())
-				{
-					asks.pop_front();
-					orders_.erase(ask->GetOrderID());
-				}
-				if (bids.empty()) // no more bid orders at this price level
-				{
-					bids_.erase(bidPrice);
-				}
-				if (asks.empty()) // no more ask orders at this price level
-				{
-					asks_.erase(askPrice);
-				}
-				trades.push_back(
-					Trade{TradeInfo{bid->GetOrderID(), bid->GetPrice(), quantity},
-						  TradeInfo{ask->GetOrderID(), ask->GetPrice(), quantity}});
-			}
-			if (!bids_.empty()) // check if there are any FillAndKill orders at this price level
-			{
-				auto &[_, bids] = *bids_.begin();
-				auto &order = bids.front();
-				if (order->GetOrderType() == OrderType::FillAndKill)
-				{
-					CancelOrder(order->GetOrderID());
-				}
-			}
-			if (!asks_.empty())
-			{
-				auto &[_, asks] = *asks_.begin();
-				auto &order = asks.front();
-				if (order->GetOrderType() == OrderType::FillAndKill)
-				{
-					CancelOrder(order->GetOrderID());
-				}
-			}
-		}
-		return trades;
-	}
+		enum class Action
+		{
+			Add,
+			Remove,
+			Match,
+		};
+	};
+	std::unordered_map<Price, LevelData> data_;
+	std::map<Price, OrderPointers, std::greater<Price>> bids_; // bids are sorted in descending order to get the best bid price
+	std::map<Price, OrderPointers, std::less<Price>> asks_;	   // asks are sorted in ascending order to get the best ask price
+	std::unordered_map<OrderId, OrderEntry> orders_;
+
+	mutable std::mutex ordersMutex_;
+	std::thread ordersPruneThread_;
+	std::condition_variable shutdownConditionVariable_;
+	std::atomic<bool> shutdown_{false};
+
+	void PruneGoodForDayOrders();
+
+	void CancelOrders(OrderIds orderIds);
+	void CancelOrderInternal(OrderId orderId);
+
+	void OnOrderCancelled(OrderPointer order);
+	void OnOrderAdded(OrderPointer order);
+	void OnOrderMatched(Price price, Quantity quantity, bool isFullyFilled);
+	void UpdateLevelData(Price price, Quantity quantity, LevelData::Action action);
+
+	bool CanFullyFill(Side side, Price price, Quantity quantity) const;
+	bool CanMatch(Side side, Price price) const; // check if the order can be matched (for FillAndKill and ImmediateOrCancel orders)
+	Trades MatchOrders();
 
 public:
-	Trades AddOrder(OrderPointer order)
-	{
-		if (orders_.contains(order->GetOrderID()))
-		{ // order already exists
-			return {};
-		}
-		if (order->GetOrderType() == OrderType::FillAndKill && !CanMatch(order->GetSide(), order->GetPrice()))
-		{ // FillAndKill order cannot be matched
-			return {};
-		}
-		OrderPointers::iterator iterator;
-		if (order->GetSide() == Side::Buy)
-		{ // add to bids
-			auto &orders = bids_[order->GetPrice()];
-			orders.push_back(order);
-			iterator = std::next(orders.begin(), orders.size() - 1);
-		}
-		else
-		{ // add to asks
-			auto &orders = asks_[order->GetPrice()];
-			orders.push_back(order);
-			iterator = std::next(orders.begin(), orders.size() - 1);
-		}
-		orders_.insert({order->GetOrderID(), OrderEntry{order, iterator}});
-		return MatchOrders();
-	}
-	void CancelOrder(OrderId orderId)
-	{
-		if (!orders_.contains(orderId))
-		{ // order does not exist
-			return;
-		}
-		const auto &[order, iterator] = orders_.at(orderId);
-		orders_.erase(orderId);
-		if (order->GetSide() == Side::Sell)
-		{ // cancel from asks
-			auto price = order->GetPrice();
-			auto &orders = asks_.at(price);
-			orders.erase(iterator);
-			if (orders.empty())
-			{ // no more orders at this price level
-				asks_.erase(price);
-			}
-		}
-		else
-		{ // cancel from bids
-			auto price = order->GetPrice();
-			auto &orders = bids_.at(price);
-			orders.erase(iterator);
-			if (orders.empty())
-			{ // no more orders at this price level
-				bids_.erase(price);
-			}
-		}
-	}
-	Trades MatchOrder(OrderModify order)
-	{
-		if (!orders_.contains(order.GetOrderID()))
-		{ // order does not exist
-			return {};
-		}
-		const auto &[existingOrder, _] = orders_.at(order.GetOrderID());
-		CancelOrder(order.GetOrderID());
-		return AddOrder(order.ToOrderPointer(existingOrder->GetOrderType()));
-	}
-	std::size_t Size() const { return orders_.size(); }
-	OrderbookLevelInfos GetLevelInfos() const
-	{
-		LevelInfos bidInfos, askInfos;
-		bidInfos.reserve(orders_.size());
-		askInfos.reserve(orders_.size());
+	Orderbook();
+	// delete copy constructor and assignment operator to prevent copying
+	// in our case, we don't need to copy the orderbook or move it around
+	// imagine we copy the orderbook, we would have two threads pruning good for day orders, then how to join? how to wait for the prune thread to finish...
+	// imagine we move the orderbook, we need to atomic transfer data structures/locks/threads...
+	Orderbook(const Orderbook &) = delete;
+	void operator=(const Orderbook &) = delete;
+	Orderbook(Orderbook &&) = delete;
+	void operator=(Orderbook &&) = delete;
+	~Orderbook();
 
-		auto CreateLevelInfos = [](Price price, const OrderPointers &orders)
-		{
-			return LevelInfo{
-				price, std::accumulate(orders.begin(), orders.end(), (Quantity)0,
-									   [](Quantity runningSum, const OrderPointer &order)
-									   { return runningSum + order->GetRemainingQuantity(); })};
-		};
-		for (const auto &[price, orders] : bids_)
-		{
-			bidInfos.push_back(CreateLevelInfos(price, orders));
-		}
-		for (const auto &[price, orders] : asks_)
-		{
-			askInfos.push_back(CreateLevelInfos(price, orders));
-		}
-		return OrderbookLevelInfos(bidInfos, askInfos);
-	}
+	Trades AddOrder(OrderPointer order);
+	void CancelOrder(OrderId orderId);
+	Trades ModifyOrder(OrderModify order);
+
+	std::size_t Size() const;
+	OrderbookLevelInfos GetOrderInfos() const;
 };
